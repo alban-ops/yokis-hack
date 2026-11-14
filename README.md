@@ -1,30 +1,28 @@
-# Yokis Hack — volets Home Assistant et stabilité radio
+# Yokis Hack pour Home Assistant
 
-Version dérivée de [nmaupu/yokis-hack](https://github.com/nmaupu/yokis-hack),
-fondée sur **v1.8.7**, conservant la licence Apache 2.0 et les crédits d'origine.
-Le projet original fournit déjà le protocole, l'appairage, les commandes radio
-et des primitives pour les volets. Cette version complète notamment leur
-intégration **MQTT / Home Assistant** ; elle ne revendique pas l'invention du protocole Yokis.
+Une passerelle ESP8266 et nRF24L01+ pour piloter les éclairages et volets radio Yokis depuis Home Assistant, via MQTT.
 
-## Ce que cette version apporte
+Cette version complète l’intégration des volets et améliore le suivi de disponibilité des modules. Elle s’appuie sur [Yokis Hack, développé par nmaupu et ses contributeurs](https://github.com/nmaupu/yokis-hack), avec une documentation du matériel, du câblage et des essais réalisés.
 
-- Volets découverts comme `cover`, commandes `OPEN`, `CLOSE`, `STOP`.
-- Arrêt immédiatement après une commande de mouvement, sans le filtrage
-  temporel appliqué aux autres commandes MQTT.
-- Suppression de l'ancienne découverte MQTT `light` pour un volet.
-- Gestion des abonnements MQTT : déduplication, remise à zéro des pointeurs,
-  vérification des topics et des tailles des messages.
-- Disponibilité : six interrogations consécutives sans réponse avant `Offline`,
-  compteur initialisé et saturé, annonce sur transition et récupération sur RX.
-- Interrogation maintenue pour les modules hors ligne et pour le mode `NO_RCPT`.
-- Présence radio distinguée du décodage ON/OFF : une réponse non décodée peut
-  rétablir la disponibilité sans inventer un état de lampe.
-- Commande `rfPower low|high|max` ; MAX au démarrage, changements à l'exécution
-  non persistants. L'identité du client MQTT reste stable par passerelle.
+## Fonctionnalités
 
-**Limite volets :** absence de mesure fiable de position. L'état de mouvement/
-ouverture affiché par Home Assistant est optimiste ; aucun pourcentage mesuré
-n'est promis. Ces commandes ne constituent pas une fonction de sécurité.
+| Fonction | Prise en charge |
+|---|---|
+| Volets | Découverte automatique dans Home Assistant et commandes d’ouverture, de fermeture et d’arrêt |
+| Éclairages | Fonctions de commande et de variation héritées du projet original, selon le module Yokis |
+| Disponibilité | Détection après six échecs consécutifs et reprise automatique du suivi dès réception d’une réponse |
+| Puissance radio | Réglage `low`, `high` ou `max` depuis la console ; MAX au démarrage |
+
+**Position des volets :** le firmware ne mesure pas leur position. Home Assistant affiche un état estimé à partir des commandes envoyées ; aucun pourcentage d’ouverture réel n’est disponible.
+
+## Évolutions de cette version
+
+- **Intégration MQTT des volets** : entités `cover`, commandes `OPEN`, `CLOSE` et `STOP`, arrêt immédiat après une commande de mouvement et remplacement de l’ancienne découverte en tant que lumière.
+- **Suivi des modules** : interrogations maintenues après une perte de communication, y compris en mode `NO_RCPT`. Une réponse radio peut rétablir la disponibilité même lorsque l’état ON/OFF ne peut pas être décodé.
+- **Traitement MQTT** : validation des messages, gestion des abonnements et identifiant de connexion stable pour chaque passerelle.
+- **Documentation radio et matérielle** : montage testé avec antenne externe, câblage complet et limites observées selon les modules.
+
+Le détail des modifications et leur historique sont disponibles dans le [journal des changements](CHANGELOG.md). Le firmware est fondé sur **Yokis Hack v1.8.7**, sous licence **Apache 2.0**.
 
 ## Montage effectivement testé
 
