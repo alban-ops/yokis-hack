@@ -1,0 +1,30 @@
+{
+  "upstream": "nmaupu/yokis-hack",
+  "tag": "v1.8.7",
+  "commit": "c2aeb5644adc2fcc2d351787946454bf46bfda1f",
+  "firmware_version": "1.8.7-volets-stabilite4-sdb",
+  "modified_source_files": [
+    "src/commands/callbacks.cpp",
+    "src/main.cpp",
+    "src/net/mqtt.cpp",
+    "src/net/mqttHass.cpp",
+    "src/RF/device.cpp",
+    "src/RF/e2bp.cpp",
+    "include/commands/callbacks.h",
+    "include/constants.h",
+    "include/net/mqtt.h",
+    "include/net/mqttHass.h",
+    "include/RF/e2bp.h",
+    "include/RF/stabilityPolicy.h"
+  ],
+  "prepared": "2026-11-14",
+  "published": false,
+  "publication_checks": {
+    "source_comparison": true,
+    "license_identical": true,
+    "host_tests": "2 PASS",
+    "esp8266_build": "SUCCESS",
+    "hardware_access": false,
+    "known_private_identifiers_found": false
+  }
+}

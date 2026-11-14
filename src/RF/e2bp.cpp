@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #include "RF/e2bp.h"
 #include "globals.h"
 #include "utils.h"
@@ -14,6 +15,9 @@ void E2bp::reset() {
     this->firstPayloadStatus = UNDEFINED;
     this->secondPayloadStatus = UNDEFINED;
     this->loopContinue = true;
+    txEvents = rxEvents = txFailedEvents = 0;
+    responseReceived = false;
+    statusQuery = false;
 }
 
 void E2bp::setDevice(Device* device) { this->device = device; }
@@ -53,7 +57,10 @@ bool E2bp::setDeviceStatus(DeviceStatus ds) {
     unsigned long timeout = millis() + 1000;
     while (millis() <= timeout && !ret) ret = sendPayload(buf);
 
-    if (ret || device->getMode() == NO_RCPT) {  // if NO_RCPT, ignore ret
+    if (device->getMode() == NO_RCPT) {
+        // A transmitted order is not a measured lamp state.
+        device->setStatus(getLastKnownDeviceStatus());
+    } else if (ret) {
         device->setStatus(ds);
         if (device->getMode() == DIMMER) {
             if (ds == ON)
@@ -192,7 +199,9 @@ DeviceStatus E2bp::pollForStatus() {
     reset();
     setupRFModule();
     getPayload(buf, PL_STATUS);
+    statusQuery = true;
     sendPayload(buf);
+    statusQuery = false;
     return firstPayloadStatus;
 }
 
@@ -361,7 +370,7 @@ void E2bp::setupRFModule() {
     write_register(RF_CH, device->getChannel());
     // setChannel(device->getChannel());
 
-    write_register(RF_SETUP, 0b00100011);
+    write_register(RF_SETUP, YokisStability::rfSetup(powerLevel));
     // setDataRate(RF24_250KBPS);
     // setPALevel(RF24_PA_LOW);
 
@@ -417,7 +426,7 @@ bool E2bp::runMainLoop() {
         delayMicroseconds(1000);
         ce(LOW);
 
-        if (device->getMode() == NO_RCPT && (nbLoops++) >= 30) {
+        if (!statusQuery && device->getMode() == NO_RCPT && (nbLoops++) >= 30) {
             break;  // Stop sending, we are not gonna receive anything
         }
     }
@@ -425,6 +434,7 @@ bool E2bp::runMainLoop() {
     // We got here right after being interrupted
     if (available()) {
         read(answerBuf, 2);
+        responseReceived = true;
 
         if (IS_DEBUG_ENABLED) {
             LOG.print("Received: ");
@@ -440,15 +450,23 @@ bool E2bp::runMainLoop() {
         // MVR500 send open or close the answerbuf take ******* - 00 00 00 11 busy
         // MVR500 after pair send status when window open 00 00 11 10 - 00 00 00 10
 
-        if (firstPayloadStatus == UNDEFINED) {
-            firstPayloadStatus =
-                (answerBuf[1] % 2 == 1 || answerBuf[0] == 0x2f) ? ON : OFF;
-        } else {
-            secondPayloadStatus =
-                (answerBuf[1] % 2 == 1 || answerBuf[0] == 0x2f) ? ON : OFF;
+        // NO_RCPT is also the fallback for an unrecognised device type.
+        // Keep its presence separate from decoding the relay state.
+        const uint8_t kind = static_cast<uint8_t>(answerBuf[0]);
+        if (device->getMode() != NO_RCPT || YokisStability::canDecodeStatus(kind)) {
+            const DeviceStatus decoded =
+                (answerBuf[1] % 2 == 1 || kind == 0x2f) ? ON : OFF;
+            if (firstPayloadStatus == UNDEFINED) firstPayloadStatus = decoded;
+            else secondPayloadStatus = decoded;
         }
     }
 
+    if (IS_DEBUG_ENABLED) {
+        // Telnet/Serial output must stay outside interrupt handlers.
+        LOG.print("RF events: TX="); LOG.print(txEvents);
+        LOG.print(" RX="); LOG.print(rxEvents);
+        LOG.print(" TX_FAILED="); LOG.println(txFailedEvents);
+    }
     return !loopContinue;  // false if timeout occurred
 }
 
@@ -472,9 +490,7 @@ void E2bp::stopMainLoop() {
 IRAM_ATTR
 #endif
 void E2bp::interruptTxOk() {
-    if (IS_DEBUG_ENABLED) {
-        LOG.println("E2bp - TX OK");
-    }
+    ++txEvents;
     write_register(NRF_CONFIG, 0b00001111);  // PRX
     ce(HIGH);
     write_register(NRF_STATUS, 0b01110000);  // Reset interrupts
@@ -484,9 +500,7 @@ void E2bp::interruptTxOk() {
 IRAM_ATTR
 #endif
 void E2bp::interruptRxReady() {
-    if (IS_DEBUG_ENABLED) {
-        LOG.println("E2bp - RX READY");
-    }
+    ++rxEvents;
     // counter++;
     stopMainLoop();
 }
@@ -496,5 +510,5 @@ IRAM_ATTR
 #endif
 void E2bp::interruptTxFailed() {
     // Ignore
-    LOG.println("TX sent failed");
+    ++txFailedEvents;
 }

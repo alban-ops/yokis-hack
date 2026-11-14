@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #if WIFI_ENABLED && (defined(ESP8266) || defined(ESP32)) && MQTT_ENABLED
 #include "net/mqtt.h"
 #include <Arduino.h>
@@ -51,6 +52,12 @@ void Mqtt::setConnectionInfo(const char* host, uint16_t port, const char* userna
 boolean Mqtt::subscribe(const char* topic) {
     LOG.print("Subscribing to topic: ");
     LOG.println(topic);
+    // Pas d'empilement de doublons apres reconnexion MQTT.
+    // La methode reconnect() a deja reabonne les topics precedents.
+    for (uint8_t i = 0; i < subscribedTopicIdx; i++) {
+        if (subscribedTopics[i] != NULL && strcmp(subscribedTopics[i], topic) == 0)
+            return true;
+    }
     if (subscribedTopicIdx >= MAX_YOKIS_DEVICES_NUM) return false;
 
     subscribedTopics[subscribedTopicIdx] = (char*)malloc(strlen(topic)+1);
@@ -73,6 +80,7 @@ void Mqtt::clearSubscriptions() {
         if (subscribedTopics[i] != NULL) {
             LOG.println(subscribedTopics[i]);
             free(subscribedTopics[i]);
+            subscribedTopics[i] = NULL;
         }
     }
 
@@ -101,14 +109,23 @@ bool Mqtt::reconnect(bool force) {
     lastConnectionRetry = millis();
 
     char buf[128];
+    // A stable per-gateway ID makes the broker replace its previous connection.
+    // A random ID can leave an old session whose delayed will overwrites Online.
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
     String clientId = "YokisHack-";
-    clientId += String(random(0xffff), HEX);
+    clientId += mac;
 
     sprintf(buf, "Connecting to MQTT %s:%hu with client ID=%s... ", getHost(), getPort(), clientId.c_str());
     LOG.print(buf);
 
-    if (this->connect(clientId.c_str(), getUsername(), getPassword())) {
+    char gatewayTopic[80];
+    gatewayAvailabilityTopic(gatewayTopic, sizeof(gatewayTopic));
+    // The broker publishes this retained will if this gateway disconnects unexpectedly.
+    if (this->connect(clientId.c_str(), getUsername(), getPassword(),
+                      gatewayTopic, 0, true, "Offline")) {
         LOG.println("connected");
+        this->publish(gatewayTopic, "Online", true);
         this->resubscribe();  // resubscribe to all configured topics
     } else {
         LOG.print("failed with state ");
@@ -129,6 +146,12 @@ boolean Mqtt::loop() {
 
     // Call parent function
     return PubSubClient::loop();
+}
+
+void Mqtt::gatewayAvailabilityTopic(char* buffer, size_t size) {
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    snprintf(buffer, size, "yokis_hack/%s/tele/LWT", mac.c_str());
 }
 
 // static - default callback logging on Serial

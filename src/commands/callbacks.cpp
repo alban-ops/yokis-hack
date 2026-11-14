@@ -1,8 +1,12 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #include "commands/callbacks.h"
 
 #include "globals.h"
 
 void registerAllCallbacks() {
+    g_serial->registerCallback(new GenericCallback(
+        "rfPower", "read/set runtime RF power: low, high, max (restart restores max)",
+        rfPowerCallback));
     // Serial setup
     g_serial->registerCallback(new GenericCallback(
         "pair",
@@ -80,8 +84,8 @@ void registerAllCallbacks() {
     #if WIFI_ENABLED
     g_serial->registerCallback(
         new GenericCallback("wifiConfig",
-                            "Configure wifi: wifiConfig \"ssid\" [\"psk\"] "
-                            "(quote values containing spaces)",
+                            "Configure wifi with parameters: ssid psk (does "
+                            "not work for psk containing spaces)",
                             wifiConfig));
     g_serial->registerCallback(
         new GenericCallback("wifiReconnect",
@@ -181,7 +185,9 @@ bool changeDeviceState(const char* params, bool (E2bp::*func)(void)) {
     g_bp->setDevice(d);
     bool ret = (g_bp->*func)();
 #if (defined(ESP8266) || defined(ESP32)) && MQTT_ENABLED
-    if (ret) {
+    if (g_mqtt != NULL) g_mqtt->recoverFromResponse(
+        d, g_bp->hasReceivedResponse());
+    if (ret && (d->getMode() != NO_RCPT || g_bp->getLastKnownDeviceStatus() != UNDEFINED)) {
         if (d->getMode() == DIMMER) {
             g_mqtt->notifyBrightness(d);
         } else {
@@ -206,6 +212,20 @@ bool offCallback(const char* params) {
 
 bool pauseShutterCallback(const char* params) {
     return changeDeviceState(params, &E2bp::pauseShutter);
+}
+
+bool rfPowerCallback(const char* params) {
+    uint8_t power = g_bp->getPowerLevel();
+    YokisStability::PowerRequest request = YokisStability::parsePowerRequest(params, power);
+    if (request == YokisStability::POWER_INVALID) {
+        LOG.println("Usage: rfPower [low|high|max]");
+        return false;
+    }
+    if (request == YokisStability::POWER_SET) g_bp->setPowerLevel(power);
+    LOG.print("RF_POWER=");
+    LOG.print(power == 1 ? "LOW (-12 dBm)" : power == 2 ? "HIGH (-6 dBm)" : "MAX (0 dBm)");
+    LOG.println("; runtime only, restart restores MAX");
+    return true;
 }
 
 bool scannerCallback(const char* params) {
@@ -486,7 +506,9 @@ bool deleteFromConfig(const char* params) {
 
 // Interrupt function
 void pollDevice(Device* d) {
-    if (FLAG_IS_ENABLED(FLAG_POLLING)) d->pollMePlease();
+    // Every configured device, including NO_RCPT, is supervised.
+    if (d != NULL && FLAG_IS_ENABLED(FLAG_POLLING))
+        d->pollMePlease();
 }
 
 
@@ -495,57 +517,22 @@ bool resetWifiConfigCallback(const char* params) {
     return resetWifiConfig();
 }
 
-// No escape mechanism is provided: a `"` can only appear in an unquoted
-// value, so a quoted value cannot itself contain a `"`.
-static bool getWifiConfigArgument(const char*& cursor, String& argument) {
-    while (*cursor == ' ' || *cursor == '\t') cursor++;
-    if (*cursor == '\0') return false;
-
-    argument = "";
-    if (*cursor == '"') {
-        cursor++;
-        while (*cursor != '\0' && *cursor != '"') {
-            argument += *cursor++;
-        }
-        if (*cursor != '"') {
-            argument = "";  // don't leak a partial value to the caller
-            return false;
-        }
-        cursor++;
-        return *cursor == '\0' || *cursor == ' ' || *cursor == '\t';
-    }
-
-    while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
-        argument += *cursor++;
-    }
-    return true;
-}
-
 bool wifiConfig(const char* params) {
-    const char* cursor = params;
-    String command;
-    String ssid;
-    String psk;
-    String extra;
+    char* paramsBak;
+    char* ssid;
+    char* psk;
 
-    if (!getWifiConfigArgument(cursor, command) ||
-        !getWifiConfigArgument(cursor, ssid)) {
-        LOG.println("Usage: wifiConfig \"ssid\" [\"psk\"]");
-        return false;
-    }
-
-    // psk is optional (open networks). Peek first: "not given" and a parse
-    // error (unterminated quote) both return false and must not be conflated.
-    // A fourth argument succeeding is an error, hence the inverted last test.
-    const char* peek = cursor;
-    while (*peek == ' ' || *peek == '\t') peek++;
-    if (*peek != '\0' && (!getWifiConfigArgument(cursor, psk) ||
-                           getWifiConfigArgument(cursor, extra))) {
-        LOG.println("Usage: wifiConfig \"ssid\" [\"psk\"]");
-        return false;
-    }
+    int len = strlen(params);
+    paramsBak = new char[len + 1];
+    strncpy(paramsBak, params, len);
+    paramsBak[len] = 0;
+    strtok(paramsBak, " ");    // ignore the command name
+    ssid = strtok(NULL, " ");  // Get the ssid
+    psk = strtok(NULL, " ");   // Get the psk if set
 
     setupWifi(ssid, psk);
+
+    delete[] paramsBak;
     return true;
 }
 

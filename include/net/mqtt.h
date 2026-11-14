@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #if WIFI_ENABLED && (defined(ESP8266) || defined(ESP32)) && MQTT_ENABLED
 #ifndef __MQTT_H__
 #define __MQTT_H__
@@ -35,6 +36,7 @@ class Mqtt : public PubSubClient, public MqttConfig {
     void clearSubscriptions();
     bool reconnect(bool=false);
     boolean loop();
+    static void gatewayAvailabilityTopic(char* buffer, size_t size);
 };
 
 #endif

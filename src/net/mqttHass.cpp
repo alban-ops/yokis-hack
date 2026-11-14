@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #if WIFI_ENABLED && (defined(ESP8266) || defined(ESP32)) && MQTT_ENABLED
 #include "net/mqttHass.h"
 #include "RF/device.h"
@@ -61,6 +62,13 @@ char* MqttHass::newMessageJson(const Device* device, char* buf) {
                 "}",
                 device->getName(), device->getName(),
                 device->getName(), device->getName());
+    } else if (device->getMode() == SHUTTER || device->getMode() == SHUTTER_BUS) {
+        // Le MVR500 fonctionne en OPEN/CLOSE/STOP, sans retour de position fiable.
+        // Pas de state_topic: Home Assistant affiche un etat optimiste.
+        snprintf(buf, MQTT_MAX_PACKET_SIZE,
+                 R"json({"name":"Volet","device_class":"shutter","command_topic":"~cmnd/COVER","payload_open":"OPEN","payload_close":"CLOSE","payload_stop":"STOP","availability_topic":"~tele/LWT","payload_available":"Online","payload_not_available":"Offline","unique_id":"esp-%s","device":{"name":"%s","identifiers":["yokis-%s"],"model":"MVR500ERX","manufacturer":"Yokis"},"~":"%s/"})json",
+                 device->getName(), device->getName(),
+                 device->getName(), device->getName());
     } else {
         sprintf(buf,
                 "{"
@@ -92,7 +100,10 @@ char* MqttHass::newMessageJson(const Device* device, char* buf) {
 }
 
 char* MqttHass::newPublishTopic(const Device* device, char* buf) {
-    sprintf(buf, "%s/light/%s/config", HASS_PREFIX, device->getName());
+    if (device->getMode() == SHUTTER || device->getMode() == SHUTTER_BUS)
+        snprintf(buf, 128, "%s/cover/%s/config", HASS_PREFIX, device->getName());
+    else
+        snprintf(buf, 128, "%s/light/%s/config", HASS_PREFIX, device->getName());
     return buf;
 }
 
@@ -102,6 +113,12 @@ bool MqttHass::publishDevice(const Device* device) {
     char topic[128];
     char payload[MQTT_MAX_PACKET_SIZE];
 
+    // Efface l'ancienne fausse entite 'light' du volet, uniquement pour un volet.
+    if (device->getMode() == SHUTTER || device->getMode() == SHUTTER_BUS) {
+        char oldTopic[128];
+        snprintf(oldTopic, sizeof(oldTopic), "%s/light/%s/config", HASS_PREFIX, device->getName());
+        this->publish(oldTopic, "", true);
+    }
     newPublishTopic(device, topic);
     newMessageJson(device, payload);
 
@@ -112,7 +129,8 @@ bool MqttHass::publishDevice(const Device* device) {
 
     ret = this->publish(topic, payload, true);
     if (ret) {
-        notifyOnline(device);
+        if (device->getAvailability() == OFFLINE) notifyOffline(device);
+        else notifyOnline(device);
     }
 
     if(ret) {
@@ -135,6 +153,15 @@ void MqttHass::notifyOnline(const Device* device) {
 
 void MqttHass::notifyOffline(const Device* device) {
     notifyAvailability(device, "Offline");
+}
+
+void MqttHass::recoverFromResponse(Device* device, bool validResponse) {
+    if (!validResponse || device == NULL) return;
+    device->pollingSuccess();
+    if (YokisStability::shouldRecover(validResponse, device->isOffline())) {
+        device->online();
+        notifyOnline(device);
+    }
 }
 
 void MqttHass::notifyPower(const Device* device) {
@@ -165,7 +192,10 @@ void MqttHass::notifyBrightness(const Device* device) {
 void MqttHass::subscribeDevice(const Device* device) {
     char buf[64];
 
-    if (device->getMode() == ON_OFF || device->getMode() == NO_RCPT) {
+    if (device->getMode() == SHUTTER || device->getMode() == SHUTTER_BUS) {
+        sprintf(buf, "%s/cmnd/COVER", device->getName());
+        this->subscribe(buf);
+    } else if (device->getMode() == ON_OFF || device->getMode() == NO_RCPT) {
         sprintf(buf, "%s/cmnd/POWER", device->getName());
         this->subscribe(buf);
     } else if (device->getMode() == DIMMER) {

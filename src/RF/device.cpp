@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #include "RF/device.h"
 
 #include "globals.h"
@@ -21,6 +22,7 @@ Device::Device(const char* dname) {
     this->setDimmerEffect(EFFECT_NONE);
     this->lastUpdateMillis = 0;
     this->hasToBePolledForStatus = false;
+    this->failedPolls = 0;
 }
 
 Device::Device(const Device* device) : Device(device->name) {
@@ -221,7 +223,8 @@ void Device::pollingSuccess() {
 
 uint8_t Device::pollingFailed() {
     this->hasToBePolledForStatus = false;
-    return ++failedPolls;
+    failedPolls = YokisStability::nextFailureCount(failedPolls);
+    return failedPolls;
 }
 
 uint8_t Device::getFailedPollings() {

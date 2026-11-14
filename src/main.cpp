@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #include <Arduino.h>
 
 #include "RF/copy.h"
@@ -202,11 +203,16 @@ void loop() {
 
     } else if (g_mqtt->connected() && g_mqtt->isDiscoveryDone()) {
         // Verify polling statuses and update via MQTT if needed
-        for (uint8_t i = 0;
-             i < g_nb_devices && FLAG_IS_ENABLED(FLAG_POLLING);
-             i++) {
+        // At most one radio poll per loop: service MQTT and the console between polls.
+        static uint8_t nextPoll = 0;
+        for (uint8_t examined = 0;
+             examined < g_nb_devices && FLAG_IS_ENABLED(FLAG_POLLING);
+             examined++) {
+            uint8_t i = (nextPoll + examined) % g_nb_devices;
             if (g_devices[i] != NULL && g_devices[i]->needsPolling()) {
                 pollForStatus(g_devices[i]);
+                nextPoll = (i + 1) % g_nb_devices;
+                break;
             }
         }
     }
@@ -227,7 +233,7 @@ void pollForStatus(Device* d) {
     g_bp->setDevice(d);
     DeviceStatus ds = g_bp->pollForStatus();
 
-    if (ds != UNDEFINED) {  // device reachable
+    if (g_bp->hasReceivedResponse()) {  // RX from the addressed module, never TX_OK alone
         if (d->getFailedPollings() > 0) {
             LOG.print("Device ");
             LOG.print(d->getName());
@@ -236,11 +242,15 @@ void pollForStatus(Device* d) {
 
         d->pollingSuccess();
 
-        if (d->isOffline()) {  // Device is back online
-            d->online();
-            g_mqtt->notifyOnline(d);
-        }
+        g_mqtt->recoverFromResponse(d, true);
 
+        // A received but undecoded answer proves presence, not ON/OFF.
+        if (ds == UNDEFINED) {
+            d->setStatus(UNDEFINED);
+            LOG.print("Device "); LOG.print(d->getName());
+            LOG.println(" replied; status undecoded");
+            return;
+        }
         // Update device status - even if unchanged
         // Hence, in case of hass restart, status are updated
         d->setStatus(ds);
@@ -252,14 +262,15 @@ void pollForStatus(Device* d) {
             g_mqtt->notifyPower(d);
         }
     } else {
-        if (d->pollingFailed() >= DEVICE_MAX_FAILED_POLLING_BEFORE_OFFLINE) {
+        uint8_t failures = d->pollingFailed();
+        if (YokisStability::shouldPublishOffline(failures, d->isOffline(), true)) {
             // Device is unreachable
             LOG.print("Device ");
             LOG.print(d->getName());
             LOG.println(" is offline");
             d->offline();
             g_mqtt->notifyOffline(d);
-        } else {
+        } else if (!d->isOffline()) {
             LOG.print("Failed to check device ");
             LOG.print(d->getName());
             LOG.print(" ");
@@ -273,38 +284,27 @@ void pollForStatus(Device* d) {
 
 #if (defined(ESP8266) || defined(ESP32)) && MQTT_ENABLED
 void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
-    char* tok;
-    char* mTokBuf = NULL;
-    char* mTopic = NULL;
-    char* mCmnd = NULL;
-    char* mPayload = NULL;
-    Device* d;
-    size_t len;
-
-    // Topic copy
-    len = strlen(topic);
-    mTopic = new char[len + 1];
-    strncpy(mTopic, topic, len);
-    mTopic[len] = 0;
-
-    // Get device
-    mTokBuf = new char[len + 1];
-    strncpy(mTokBuf, mTopic, len);
-    mTokBuf[len] = 0;
-    tok = strtok(mTokBuf, "/");  // device name
-    d = Device::getFromList(g_devices, MAX_YOKIS_DEVICES_NUM, tok);
-
-    // Get cmnd type (POWER or BRIGHTNESS)
-    tok = strtok(NULL, "/");  // cmnd
-    tok = strtok(NULL, "/");  // POWER or BRIGHTNESS
-    len = strlen(tok);
-    mCmnd = new char[len + 1];
-    strncpy(mCmnd, tok, len);
-    mCmnd[len] = 0;
+    char name[MAX_COMMAND_FULL_LENGTH];
+    char mCmnd[32];
+    char mPayload[64];
+    if (!YokisStability::parseCommandTopic(topic, name, sizeof(name),
+                                          mCmnd, sizeof(mCmnd)) ||
+        payload == NULL || length == 0 || length >= sizeof(mPayload) ||
+        memchr(payload, '\0', length) != NULL) {
+        LOG.println("Ignoring malformed MQTT command");
+        return;
+    }
+    Device* d = Device::getFromList(g_devices, g_nb_devices, name);
+    if (d == NULL) {
+        LOG.println("Ignoring MQTT command for unknown device");
+        return;
+    }
 
     // If we update this device too soon, ignore the payload except for FX
     unsigned long now = millis();
-    if (d->getLastUpdateMillis() + MQTT_UPDATE_MILLIS_WINDOW > now && strcmp(mCmnd, "FX") != 0) {
+    if (strcmp(mCmnd, "COVER") != 0 &&
+        static_cast<unsigned long>(now - d->getLastUpdateMillis()) < MQTT_UPDATE_MILLIS_WINDOW &&
+        strcmp(mCmnd, "FX") != 0) {
         LOG.println(
             "Ignoring MQTT message: received too soon for this device");
         LOG.print("Last update: ");
@@ -314,23 +314,28 @@ void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
         LOG.print("Difference: ");
         LOG.println(now - d->getLastUpdateMillis());
 
-        delete[] mTopic;
-        delete[] mTokBuf;
         return;
     }
 
     // Get payload
-    mPayload = new char[length + 1];
-    strncpy(mPayload, (char*)payload, length);  // consider payload as char*
+    memcpy(mPayload, payload, length);
     mPayload[length] = 0;
 
     // Processing MQTT message
     IrqManager::irqType = E2BP;
     g_bp->setDevice(d);
+    // An ignored/invalid payload must not reuse the last transaction's response.
+    g_bp->reset();
     switch (d->getMode()) {
-        case ON_OFF:
         case SHUTTER:
         case SHUTTER_BUS:
+            if (strcmp(mCmnd, "COVER") == 0) {
+                if (strcmp(mPayload, "OPEN") == 0) g_bp->on();
+                else if (strcmp(mPayload, "CLOSE") == 0) g_bp->off();
+                else if (strcmp(mPayload, "STOP") == 0) g_bp->pauseShutter();
+            }
+            break;
+        case ON_OFF:
         case NO_RCPT:
             if (strcmp(mPayload, "ON") == 0) {
                 g_bp->on();
@@ -339,7 +344,8 @@ void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
             } else if (strcmp(mPayload, "PAUSE") == 0) {
                 g_bp->pauseShutter();
             }
-            g_mqtt->notifyPower(d);
+            if (d->getMode() != NO_RCPT || g_bp->getLastKnownDeviceStatus() != UNDEFINED)
+                g_mqtt->notifyPower(d);
             break;
         case DIMMER:
             if (strcmp(mCmnd, "POWER") == 0 || strcmp(mCmnd,"BRIGHTNESS") == 0) {
@@ -391,9 +397,6 @@ void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
             break;
     }
 
-    delete[] mTopic;
-    delete[] mTokBuf;
-    delete[] mCmnd;
-    delete[] mPayload;
+    g_mqtt->recoverFromResponse(d, g_bp->hasReceivedResponse());
 }
 #endif  // #if (defined(ESP8266) || defined(ESP32)) && defined(MQTT_ENABLED)

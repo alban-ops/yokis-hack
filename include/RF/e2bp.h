@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #ifndef __E2BP_H__
 #define __E2BP_H__
 
@@ -6,6 +7,7 @@
 #include "RF/RF24_forked.h"
 #include "RF/configurator.h"
 #include "RF/device.h"
+#include "RF/stabilityPolicy.h"
 
 #define PAYLOAD_LENGTH 9
 #define MAIN_LOOP_TIMEOUT_MILLIS 500
@@ -25,8 +27,12 @@ class E2bp : public RFConfigurator {
    private:
     Device *device;
     bool loopContinue;
+    bool responseReceived = false;
+    bool statusQuery = false;
     DeviceStatus firstPayloadStatus, secondPayloadStatus;
     char answerBuf[2];
+    uint8_t powerLevel = YokisStability::DEFAULT_POWER;
+    volatile uint16_t txEvents = 0, rxEvents = 0, txFailedEvents = 0;
 
     bool setDeviceStatus(DeviceStatus);
     uint8_t *getPayload(uint8_t *, PayloadType);
@@ -79,6 +85,7 @@ class E2bp : public RFConfigurator {
     DeviceStatus getLastKnownDeviceStatus();
     // Get the device status (ON or OFF) - experimental !
     DeviceStatus pollForStatus();
+    bool hasReceivedResponse() const { return responseReceived; }
     DeviceMode getDeviceModeFromRecvData();
     void interruptTxOk() override;
     void interruptRxReady() override;
@@ -87,6 +94,8 @@ class E2bp : public RFConfigurator {
     // Getters / setters
     void setDevice(Device *);
     const Device *getDevice();
+    uint8_t getPowerLevel() const { return powerLevel; }
+    void setPowerLevel(uint8_t level) { if (level >= 1 && level <= 3) powerLevel = level; }
 };
 
 #endif  // __E2BP_H__

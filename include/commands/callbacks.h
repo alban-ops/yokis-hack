@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #ifndef __CALLBACKS_H__
 #define __CALLBACKS_H__
 
@@ -29,6 +30,7 @@ bool onCallback(const char*);
 bool offCallback(const char*);
 bool toggleCallback(const char*);
 bool pauseShutterCallback(const char*);
+bool rfPowerCallback(const char*);
 bool scannerCallback(const char*);
 bool copyCallback(const char*);
 bool displayDevices(const char*);

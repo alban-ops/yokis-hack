@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #if WIFI_ENABLED && (defined(ESP8266) || defined(ESP32)) && MQTT_ENABLED
 #ifndef __MQTT_HASS_H__
 #define __MQTT_HASS_H__
@@ -35,6 +36,7 @@ class MqttHass : public Mqtt {
     void notifyOffline(const Device*);
     void notifyPower(const Device*);
     void notifyPower(const Device*, DeviceStatus);
+    void recoverFromResponse(Device*, bool validResponse);
     void notifyBrightness(const Device* device);
 };
 

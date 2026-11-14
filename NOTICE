@@ -1,0 +1,16 @@
+Yokis Hack — shutters and stability derivative
+
+Based on nmaupu/yokis-hack, tag v1.8.7, commit
+c2aeb5644adc2fcc2d351787946454bf46bfda1f.
+Original project and reverse engineering: Nicolas Maupu and upstream contributors.
+https://github.com/nmaupu/yokis-hack
+Apache License 2.0: see LICENSE, retained without modification.
+
+Derivative preparation and installation feedback: alban-ops, 2026.
+Changes: Home Assistant shutter discovery/commands, MQTT handling,
+radio power selection, availability/recovery and NO_RCPT supervision.
+Modified source files carry a prominent header. Detailed differences are
+provided in docs/firmware-changes-vs-v1.8.7.patch.
+Existing upstream copyright notices and documentation are retained.
+This is an unofficial project, not endorsed by Yokis/Urmet.
+External libraries retain their respective licenses and are installed by PlatformIO.

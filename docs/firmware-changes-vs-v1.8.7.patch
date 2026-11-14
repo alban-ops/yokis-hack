@@ -1,0 +1,677 @@
+--- a/src/commands/callbacks.cpp
++++ b/src/commands/callbacks.cpp
+@@ -3,6 +3,9 @@
+ #include "globals.h"
+ 
+ void registerAllCallbacks() {
++    g_serial->registerCallback(new GenericCallback(
++        "rfPower", "read/set runtime RF power: low, high, max (restart restores max)",
++        rfPowerCallback));
+     // Serial setup
+     g_serial->registerCallback(new GenericCallback(
+         "pair",
+@@ -181,7 +184,9 @@
+     g_bp->setDevice(d);
+     bool ret = (g_bp->*func)();
+ #if (defined(ESP8266) || defined(ESP32)) && MQTT_ENABLED
+-    if (ret) {
++    if (g_mqtt != NULL) g_mqtt->recoverFromResponse(
++        d, g_bp->hasReceivedResponse());
++    if (ret && (d->getMode() != NO_RCPT || g_bp->getLastKnownDeviceStatus() != UNDEFINED)) {
+         if (d->getMode() == DIMMER) {
+             g_mqtt->notifyBrightness(d);
+         } else {
+@@ -206,6 +211,20 @@
+ 
+ bool pauseShutterCallback(const char* params) {
+     return changeDeviceState(params, &E2bp::pauseShutter);
++}
++
++bool rfPowerCallback(const char* params) {
++    uint8_t power = g_bp->getPowerLevel();
++    YokisStability::PowerRequest request = YokisStability::parsePowerRequest(params, power);
++    if (request == YokisStability::POWER_INVALID) {
++        LOG.println("Usage: rfPower [low|high|max]");
++        return false;
++    }
++    if (request == YokisStability::POWER_SET) g_bp->setPowerLevel(power);
++    LOG.print("RF_POWER=");
++    LOG.print(power == 1 ? "LOW (-12 dBm)" : power == 2 ? "HIGH (-6 dBm)" : "MAX (0 dBm)");
++    LOG.println("; runtime only, restart restores MAX");
++    return true;
+ }
+ 
+ bool scannerCallback(const char* params) {
+@@ -486,7 +505,9 @@
+ 
+ // Interrupt function
+ void pollDevice(Device* d) {
+-    if (FLAG_IS_ENABLED(FLAG_POLLING)) d->pollMePlease();
++    // Every configured device, including NO_RCPT, is supervised.
++    if (d != NULL && FLAG_IS_ENABLED(FLAG_POLLING))
++        d->pollMePlease();
+ }
+ 
+ 
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -202,11 +202,16 @@
+ 
+     } else if (g_mqtt->connected() && g_mqtt->isDiscoveryDone()) {
+         // Verify polling statuses and update via MQTT if needed
+-        for (uint8_t i = 0;
+-             i < g_nb_devices && FLAG_IS_ENABLED(FLAG_POLLING);
+-             i++) {
++        // At most one radio poll per loop: service MQTT and the console between polls.
++        static uint8_t nextPoll = 0;
++        for (uint8_t examined = 0;
++             examined < g_nb_devices && FLAG_IS_ENABLED(FLAG_POLLING);
++             examined++) {
++            uint8_t i = (nextPoll + examined) % g_nb_devices;
+             if (g_devices[i] != NULL && g_devices[i]->needsPolling()) {
+                 pollForStatus(g_devices[i]);
++                nextPoll = (i + 1) % g_nb_devices;
++                break;
+             }
+         }
+     }
+@@ -227,7 +232,7 @@
+     g_bp->setDevice(d);
+     DeviceStatus ds = g_bp->pollForStatus();
+ 
+-    if (ds != UNDEFINED) {  // device reachable
++    if (g_bp->hasReceivedResponse()) {  // RX from the addressed module, never TX_OK alone
+         if (d->getFailedPollings() > 0) {
+             LOG.print("Device ");
+             LOG.print(d->getName());
+@@ -236,11 +241,15 @@
+ 
+         d->pollingSuccess();
+ 
+-        if (d->isOffline()) {  // Device is back online
+-            d->online();
+-            g_mqtt->notifyOnline(d);
+-        }
+-
++        g_mqtt->recoverFromResponse(d, true);
++
++        // A received but undecoded answer proves presence, not ON/OFF.
++        if (ds == UNDEFINED) {
++            d->setStatus(UNDEFINED);
++            LOG.print("Device "); LOG.print(d->getName());
++            LOG.println(" replied; status undecoded");
++            return;
++        }
+         // Update device status - even if unchanged
+         // Hence, in case of hass restart, status are updated
+         d->setStatus(ds);
+@@ -252,14 +261,15 @@
+             g_mqtt->notifyPower(d);
+         }
+     } else {
+-        if (d->pollingFailed() >= DEVICE_MAX_FAILED_POLLING_BEFORE_OFFLINE) {
++        uint8_t failures = d->pollingFailed();
++        if (YokisStability::shouldPublishOffline(failures, d->isOffline(), true)) {
+             // Device is unreachable
+             LOG.print("Device ");
+             LOG.print(d->getName());
+             LOG.println(" is offline");
+             d->offline();
+             g_mqtt->notifyOffline(d);
+-        } else {
++        } else if (!d->isOffline()) {
+             LOG.print("Failed to check device ");
+             LOG.print(d->getName());
+             LOG.print(" ");
+@@ -273,38 +283,27 @@
+ 
+ #if (defined(ESP8266) || defined(ESP32)) && MQTT_ENABLED
+ void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
+-    char* tok;
+-    char* mTokBuf = NULL;
+-    char* mTopic = NULL;
+-    char* mCmnd = NULL;
+-    char* mPayload = NULL;
+-    Device* d;
+-    size_t len;
+-
+-    // Topic copy
+-    len = strlen(topic);
+-    mTopic = new char[len + 1];
+-    strncpy(mTopic, topic, len);
+-    mTopic[len] = 0;
+-
+-    // Get device
+-    mTokBuf = new char[len + 1];
+-    strncpy(mTokBuf, mTopic, len);
+-    mTokBuf[len] = 0;
+-    tok = strtok(mTokBuf, "/");  // device name
+-    d = Device::getFromList(g_devices, MAX_YOKIS_DEVICES_NUM, tok);
+-
+-    // Get cmnd type (POWER or BRIGHTNESS)
+-    tok = strtok(NULL, "/");  // cmnd
+-    tok = strtok(NULL, "/");  // POWER or BRIGHTNESS
+-    len = strlen(tok);
+-    mCmnd = new char[len + 1];
+-    strncpy(mCmnd, tok, len);
+-    mCmnd[len] = 0;
++    char name[MAX_COMMAND_FULL_LENGTH];
++    char mCmnd[32];
++    char mPayload[64];
++    if (!YokisStability::parseCommandTopic(topic, name, sizeof(name),
++                                          mCmnd, sizeof(mCmnd)) ||
++        payload == NULL || length == 0 || length >= sizeof(mPayload) ||
++        memchr(payload, '\0', length) != NULL) {
++        LOG.println("Ignoring malformed MQTT command");
++        return;
++    }
++    Device* d = Device::getFromList(g_devices, g_nb_devices, name);
++    if (d == NULL) {
++        LOG.println("Ignoring MQTT command for unknown device");
++        return;
++    }
+ 
+     // If we update this device too soon, ignore the payload except for FX
+     unsigned long now = millis();
+-    if (d->getLastUpdateMillis() + MQTT_UPDATE_MILLIS_WINDOW > now && strcmp(mCmnd, "FX") != 0) {
++    if (strcmp(mCmnd, "COVER") != 0 &&
++        static_cast<unsigned long>(now - d->getLastUpdateMillis()) < MQTT_UPDATE_MILLIS_WINDOW &&
++        strcmp(mCmnd, "FX") != 0) {
+         LOG.println(
+             "Ignoring MQTT message: received too soon for this device");
+         LOG.print("Last update: ");
+@@ -314,23 +313,28 @@
+         LOG.print("Difference: ");
+         LOG.println(now - d->getLastUpdateMillis());
+ 
+-        delete[] mTopic;
+-        delete[] mTokBuf;
+         return;
+     }
+ 
+     // Get payload
+-    mPayload = new char[length + 1];
+-    strncpy(mPayload, (char*)payload, length);  // consider payload as char*
++    memcpy(mPayload, payload, length);
+     mPayload[length] = 0;
+ 
+     // Processing MQTT message
+     IrqManager::irqType = E2BP;
+     g_bp->setDevice(d);
++    // An ignored/invalid payload must not reuse the last transaction's response.
++    g_bp->reset();
+     switch (d->getMode()) {
+-        case ON_OFF:
+         case SHUTTER:
+         case SHUTTER_BUS:
++            if (strcmp(mCmnd, "COVER") == 0) {
++                if (strcmp(mPayload, "OPEN") == 0) g_bp->on();
++                else if (strcmp(mPayload, "CLOSE") == 0) g_bp->off();
++                else if (strcmp(mPayload, "STOP") == 0) g_bp->pauseShutter();
++            }
++            break;
++        case ON_OFF:
+         case NO_RCPT:
+             if (strcmp(mPayload, "ON") == 0) {
+                 g_bp->on();
+@@ -339,7 +343,8 @@
+             } else if (strcmp(mPayload, "PAUSE") == 0) {
+                 g_bp->pauseShutter();
+             }
+-            g_mqtt->notifyPower(d);
++            if (d->getMode() != NO_RCPT || g_bp->getLastKnownDeviceStatus() != UNDEFINED)
++                g_mqtt->notifyPower(d);
+             break;
+         case DIMMER:
+             if (strcmp(mCmnd, "POWER") == 0 || strcmp(mCmnd,"BRIGHTNESS") == 0) {
+@@ -391,9 +396,6 @@
+             break;
+     }
+ 
+-    delete[] mTopic;
+-    delete[] mTokBuf;
+-    delete[] mCmnd;
+-    delete[] mPayload;
++    g_mqtt->recoverFromResponse(d, g_bp->hasReceivedResponse());
+ }
+ #endif  // #if (defined(ESP8266) || defined(ESP32)) && defined(MQTT_ENABLED)
+--- a/src/net/mqtt.cpp
++++ b/src/net/mqtt.cpp
+@@ -51,6 +51,12 @@
+ boolean Mqtt::subscribe(const char* topic) {
+     LOG.print("Subscribing to topic: ");
+     LOG.println(topic);
++    // Pas d'empilement de doublons apres reconnexion MQTT.
++    // La methode reconnect() a deja reabonne les topics precedents.
++    for (uint8_t i = 0; i < subscribedTopicIdx; i++) {
++        if (subscribedTopics[i] != NULL && strcmp(subscribedTopics[i], topic) == 0)
++            return true;
++    }
+     if (subscribedTopicIdx >= MAX_YOKIS_DEVICES_NUM) return false;
+ 
+     subscribedTopics[subscribedTopicIdx] = (char*)malloc(strlen(topic)+1);
+@@ -73,6 +79,7 @@
+         if (subscribedTopics[i] != NULL) {
+             LOG.println(subscribedTopics[i]);
+             free(subscribedTopics[i]);
++            subscribedTopics[i] = NULL;
+         }
+     }
+ 
+@@ -101,14 +108,23 @@
+     lastConnectionRetry = millis();
+ 
+     char buf[128];
++    // A stable per-gateway ID makes the broker replace its previous connection.
++    // A random ID can leave an old session whose delayed will overwrites Online.
++    String mac = WiFi.macAddress();
++    mac.replace(":", "");
+     String clientId = "YokisHack-";
+-    clientId += String(random(0xffff), HEX);
++    clientId += mac;
+ 
+     sprintf(buf, "Connecting to MQTT %s:%hu with client ID=%s... ", getHost(), getPort(), clientId.c_str());
+     LOG.print(buf);
+ 
+-    if (this->connect(clientId.c_str(), getUsername(), getPassword())) {
++    char gatewayTopic[80];
++    gatewayAvailabilityTopic(gatewayTopic, sizeof(gatewayTopic));
++    // The broker publishes this retained will if this gateway disconnects unexpectedly.
++    if (this->connect(clientId.c_str(), getUsername(), getPassword(),
++                      gatewayTopic, 0, true, "Offline")) {
+         LOG.println("connected");
++        this->publish(gatewayTopic, "Online", true);
+         this->resubscribe();  // resubscribe to all configured topics
+     } else {
+         LOG.print("failed with state ");
+@@ -131,6 +147,12 @@
+     return PubSubClient::loop();
+ }
+ 
++void Mqtt::gatewayAvailabilityTopic(char* buffer, size_t size) {
++    String mac = WiFi.macAddress();
++    mac.replace(":", "");
++    snprintf(buffer, size, "yokis_hack/%s/tele/LWT", mac.c_str());
++}
++
+ // static - default callback logging on Serial
+ void Mqtt::callback(char* topic, uint8_t* payload, unsigned int length) {
+     LOG.print("Message topic: ");
+--- a/src/net/mqttHass.cpp
++++ b/src/net/mqttHass.cpp
+@@ -61,6 +61,13 @@
+                 "}",
+                 device->getName(), device->getName(),
+                 device->getName(), device->getName());
++    } else if (device->getMode() == SHUTTER || device->getMode() == SHUTTER_BUS) {
++        // Le MVR500 fonctionne en OPEN/CLOSE/STOP, sans retour de position fiable.
++        // Pas de state_topic: Home Assistant affiche un etat optimiste.
++        snprintf(buf, MQTT_MAX_PACKET_SIZE,
++                 R"json({"name":"Volet","device_class":"shutter","command_topic":"~cmnd/COVER","payload_open":"OPEN","payload_close":"CLOSE","payload_stop":"STOP","availability_topic":"~tele/LWT","payload_available":"Online","payload_not_available":"Offline","unique_id":"esp-%s","device":{"name":"%s","identifiers":["yokis-%s"],"model":"MVR500ERX","manufacturer":"Yokis"},"~":"%s/"})json",
++                 device->getName(), device->getName(),
++                 device->getName(), device->getName());
+     } else {
+         sprintf(buf,
+                 "{"
+@@ -92,7 +99,10 @@
+ }
+ 
+ char* MqttHass::newPublishTopic(const Device* device, char* buf) {
+-    sprintf(buf, "%s/light/%s/config", HASS_PREFIX, device->getName());
++    if (device->getMode() == SHUTTER || device->getMode() == SHUTTER_BUS)
++        snprintf(buf, 128, "%s/cover/%s/config", HASS_PREFIX, device->getName());
++    else
++        snprintf(buf, 128, "%s/light/%s/config", HASS_PREFIX, device->getName());
+     return buf;
+ }
+ 
+@@ -102,6 +112,12 @@
+     char topic[128];
+     char payload[MQTT_MAX_PACKET_SIZE];
+ 
++    // Efface l'ancienne fausse entite 'light' du volet, uniquement pour un volet.
++    if (device->getMode() == SHUTTER || device->getMode() == SHUTTER_BUS) {
++        char oldTopic[128];
++        snprintf(oldTopic, sizeof(oldTopic), "%s/light/%s/config", HASS_PREFIX, device->getName());
++        this->publish(oldTopic, "", true);
++    }
+     newPublishTopic(device, topic);
+     newMessageJson(device, payload);
+ 
+@@ -112,7 +128,8 @@
+ 
+     ret = this->publish(topic, payload, true);
+     if (ret) {
+-        notifyOnline(device);
++        if (device->getAvailability() == OFFLINE) notifyOffline(device);
++        else notifyOnline(device);
+     }
+ 
+     if(ret) {
+@@ -135,6 +152,15 @@
+ 
+ void MqttHass::notifyOffline(const Device* device) {
+     notifyAvailability(device, "Offline");
++}
++
++void MqttHass::recoverFromResponse(Device* device, bool validResponse) {
++    if (!validResponse || device == NULL) return;
++    device->pollingSuccess();
++    if (YokisStability::shouldRecover(validResponse, device->isOffline())) {
++        device->online();
++        notifyOnline(device);
++    }
+ }
+ 
+ void MqttHass::notifyPower(const Device* device) {
+@@ -165,7 +191,10 @@
+ void MqttHass::subscribeDevice(const Device* device) {
+     char buf[64];
+ 
+-    if (device->getMode() == ON_OFF || device->getMode() == NO_RCPT) {
++    if (device->getMode() == SHUTTER || device->getMode() == SHUTTER_BUS) {
++        sprintf(buf, "%s/cmnd/COVER", device->getName());
++        this->subscribe(buf);
++    } else if (device->getMode() == ON_OFF || device->getMode() == NO_RCPT) {
+         sprintf(buf, "%s/cmnd/POWER", device->getName());
+         this->subscribe(buf);
+     } else if (device->getMode() == DIMMER) {
+--- a/src/RF/device.cpp
++++ b/src/RF/device.cpp
+@@ -21,6 +21,7 @@
+     this->setDimmerEffect(EFFECT_NONE);
+     this->lastUpdateMillis = 0;
+     this->hasToBePolledForStatus = false;
++    this->failedPolls = 0;
+ }
+ 
+ Device::Device(const Device* device) : Device(device->name) {
+@@ -221,7 +222,8 @@
+ 
+ uint8_t Device::pollingFailed() {
+     this->hasToBePolledForStatus = false;
+-    return ++failedPolls;
++    failedPolls = YokisStability::nextFailureCount(failedPolls);
++    return failedPolls;
+ }
+ 
+ uint8_t Device::getFailedPollings() {
+--- a/src/RF/e2bp.cpp
++++ b/src/RF/e2bp.cpp
+@@ -14,6 +14,9 @@
+     this->firstPayloadStatus = UNDEFINED;
+     this->secondPayloadStatus = UNDEFINED;
+     this->loopContinue = true;
++    txEvents = rxEvents = txFailedEvents = 0;
++    responseReceived = false;
++    statusQuery = false;
+ }
+ 
+ void E2bp::setDevice(Device* device) { this->device = device; }
+@@ -53,7 +56,10 @@
+     unsigned long timeout = millis() + 1000;
+     while (millis() <= timeout && !ret) ret = sendPayload(buf);
+ 
+-    if (ret || device->getMode() == NO_RCPT) {  // if NO_RCPT, ignore ret
++    if (device->getMode() == NO_RCPT) {
++        // A transmitted order is not a measured lamp state.
++        device->setStatus(getLastKnownDeviceStatus());
++    } else if (ret) {
+         device->setStatus(ds);
+         if (device->getMode() == DIMMER) {
+             if (ds == ON)
+@@ -192,7 +198,9 @@
+     reset();
+     setupRFModule();
+     getPayload(buf, PL_STATUS);
++    statusQuery = true;
+     sendPayload(buf);
++    statusQuery = false;
+     return firstPayloadStatus;
+ }
+ 
+@@ -361,7 +369,7 @@
+     write_register(RF_CH, device->getChannel());
+     // setChannel(device->getChannel());
+ 
+-    write_register(RF_SETUP, 0b00100011);
++    write_register(RF_SETUP, YokisStability::rfSetup(powerLevel));
+     // setDataRate(RF24_250KBPS);
+     // setPALevel(RF24_PA_LOW);
+ 
+@@ -417,7 +425,7 @@
+         delayMicroseconds(1000);
+         ce(LOW);
+ 
+-        if (device->getMode() == NO_RCPT && (nbLoops++) >= 30) {
++        if (!statusQuery && device->getMode() == NO_RCPT && (nbLoops++) >= 30) {
+             break;  // Stop sending, we are not gonna receive anything
+         }
+     }
+@@ -425,6 +433,7 @@
+     // We got here right after being interrupted
+     if (available()) {
+         read(answerBuf, 2);
++        responseReceived = true;
+ 
+         if (IS_DEBUG_ENABLED) {
+             LOG.print("Received: ");
+@@ -440,15 +449,23 @@
+         // MVR500 send open or close the answerbuf take ******* - 00 00 00 11 busy
+         // MVR500 after pair send status when window open 00 00 11 10 - 00 00 00 10
+ 
+-        if (firstPayloadStatus == UNDEFINED) {
+-            firstPayloadStatus =
+-                (answerBuf[1] % 2 == 1 || answerBuf[0] == 0x2f) ? ON : OFF;
+-        } else {
+-            secondPayloadStatus =
+-                (answerBuf[1] % 2 == 1 || answerBuf[0] == 0x2f) ? ON : OFF;
+-        }
+-    }
+-
++        // NO_RCPT is also the fallback for an unrecognised device type.
++        // Keep its presence separate from decoding the relay state.
++        const uint8_t kind = static_cast<uint8_t>(answerBuf[0]);
++        if (device->getMode() != NO_RCPT || YokisStability::canDecodeStatus(kind)) {
++            const DeviceStatus decoded =
++                (answerBuf[1] % 2 == 1 || kind == 0x2f) ? ON : OFF;
++            if (firstPayloadStatus == UNDEFINED) firstPayloadStatus = decoded;
++            else secondPayloadStatus = decoded;
++        }
++    }
++
++    if (IS_DEBUG_ENABLED) {
++        // Telnet/Serial output must stay outside interrupt handlers.
++        LOG.print("RF events: TX="); LOG.print(txEvents);
++        LOG.print(" RX="); LOG.print(rxEvents);
++        LOG.print(" TX_FAILED="); LOG.println(txFailedEvents);
++    }
+     return !loopContinue;  // false if timeout occurred
+ }
+ 
+@@ -472,9 +489,7 @@
+ IRAM_ATTR
+ #endif
+ void E2bp::interruptTxOk() {
+-    if (IS_DEBUG_ENABLED) {
+-        LOG.println("E2bp - TX OK");
+-    }
++    ++txEvents;
+     write_register(NRF_CONFIG, 0b00001111);  // PRX
+     ce(HIGH);
+     write_register(NRF_STATUS, 0b01110000);  // Reset interrupts
+@@ -484,9 +499,7 @@
+ IRAM_ATTR
+ #endif
+ void E2bp::interruptRxReady() {
+-    if (IS_DEBUG_ENABLED) {
+-        LOG.println("E2bp - RX READY");
+-    }
++    ++rxEvents;
+     // counter++;
+     stopMainLoop();
+ }
+@@ -496,5 +509,5 @@
+ #endif
+ void E2bp::interruptTxFailed() {
+     // Ignore
+-    LOG.println("TX sent failed");
+-}
++    ++txFailedEvents;
++}
+--- a/include/commands/callbacks.h
++++ b/include/commands/callbacks.h
+@@ -29,6 +29,7 @@
+ bool offCallback(const char*);
+ bool toggleCallback(const char*);
+ bool pauseShutterCallback(const char*);
++bool rfPowerCallback(const char*);
+ bool scannerCallback(const char*);
+ bool copyCallback(const char*);
+ bool displayDevices(const char*);
+--- a/include/constants.h
++++ b/include/constants.h
+@@ -52,6 +52,7 @@
+ #define YOKIS_CMD_OFF_SHUTTER 0xfa
+ #define YOKIS_CMD_SHUTTER_PAUSE 0x1a
+ 
+-#define DEVICE_MAX_FAILED_POLLING_BEFORE_OFFLINE 3
++#include "RF/stabilityPolicy.h"
++#define DEVICE_MAX_FAILED_POLLING_BEFORE_OFFLINE YokisStability::OFFLINE_FAILURES
+ 
+ #endif
+--- a/include/net/mqtt.h
++++ b/include/net/mqtt.h
+@@ -35,6 +35,7 @@
+     void clearSubscriptions();
+     bool reconnect(bool=false);
+     boolean loop();
++    static void gatewayAvailabilityTopic(char* buffer, size_t size);
+ };
+ 
+ #endif
+--- a/include/net/mqttHass.h
++++ b/include/net/mqttHass.h
+@@ -35,6 +35,7 @@
+     void notifyOffline(const Device*);
+     void notifyPower(const Device*);
+     void notifyPower(const Device*, DeviceStatus);
++    void recoverFromResponse(Device*, bool validResponse);
+     void notifyBrightness(const Device* device);
+ };
+ 
+--- a/include/RF/e2bp.h
++++ b/include/RF/e2bp.h
+@@ -6,6 +6,7 @@
+ #include "RF/RF24_forked.h"
+ #include "RF/configurator.h"
+ #include "RF/device.h"
++#include "RF/stabilityPolicy.h"
+ 
+ #define PAYLOAD_LENGTH 9
+ #define MAIN_LOOP_TIMEOUT_MILLIS 500
+@@ -25,8 +26,12 @@
+    private:
+     Device *device;
+     bool loopContinue;
++    bool responseReceived = false;
++    bool statusQuery = false;
+     DeviceStatus firstPayloadStatus, secondPayloadStatus;
+     char answerBuf[2];
++    uint8_t powerLevel = YokisStability::DEFAULT_POWER;
++    volatile uint16_t txEvents = 0, rxEvents = 0, txFailedEvents = 0;
+ 
+     bool setDeviceStatus(DeviceStatus);
+     uint8_t *getPayload(uint8_t *, PayloadType);
+@@ -79,6 +84,7 @@
+     DeviceStatus getLastKnownDeviceStatus();
+     // Get the device status (ON or OFF) - experimental !
+     DeviceStatus pollForStatus();
++    bool hasReceivedResponse() const { return responseReceived; }
+     DeviceMode getDeviceModeFromRecvData();
+     void interruptTxOk() override;
+     void interruptRxReady() override;
+@@ -87,6 +93,8 @@
+     // Getters / setters
+     void setDevice(Device *);
+     const Device *getDevice();
++    uint8_t getPowerLevel() const { return powerLevel; }
++    void setPowerLevel(uint8_t level) { if (level >= 1 && level <= 3) powerLevel = level; }
+ };
+ 
+ #endif  // __E2BP_H__
+--- a/include/RF/stabilityPolicy.h
++++ b/include/RF/stabilityPolicy.h
+@@ -0,0 +1,72 @@
++#ifndef YOKIS_STABILITY_POLICY_H
++#define YOKIS_STABILITY_POLICY_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++namespace YokisStability {
++static const uint8_t OFFLINE_FAILURES = 6;
++static const uint8_t DEFAULT_POWER = 3;  // PA_MAX, restored on every boot.
++
++inline bool canDecodeStatus(uint8_t kind) {
++    return kind == 0 || kind == 1 || kind == 0x1e || kind == 0x2f;
++}
++
++inline uint8_t nextFailureCount(uint8_t count) {
++    return count == UINT8_MAX ? count : static_cast<uint8_t>(count + 1);
++}
++
++inline bool shouldPublishOffline(uint8_t failures, bool alreadyOffline,
++                                 bool expectsResponse) {
++    return expectsResponse && !alreadyOffline && failures >= OFFLINE_FAILURES;
++}
++
++inline bool shouldRecover(bool validResponse, bool alreadyOffline) {
++    return validResponse && alreadyOffline;
++}
++
++inline uint8_t rfSetup(uint8_t power) {
++    // Preserve 250 kbit/s and the existing low bit; change only RF_PWR.
++    return static_cast<uint8_t>((0x23 & ~0x06) | ((power & 3) << 1));
++}
++
++enum PowerRequest { POWER_INVALID, POWER_READ, POWER_SET };
++inline PowerRequest parsePowerRequest(const char* text, uint8_t& power) {
++    if (!text || strncmp(text, "rfPower", 7) != 0) return POWER_INVALID;
++    text += 7;
++    if (*text != '\0' && *text != ' ') return POWER_INVALID;
++    while (*text == ' ') ++text;
++    if (*text == '\0') return POWER_READ;
++    const char* end = text;
++    while (*end && *end != ' ') ++end;
++    size_t size = static_cast<size_t>(end - text);
++    while (*end == ' ') ++end;
++    if (*end) return POWER_INVALID;
++    uint8_t parsed;
++    if (size == 3 && strncmp(text, "low", 3) == 0) parsed = 1;
++    else if (size == 4 && strncmp(text, "high", 4) == 0) parsed = 2;
++    else if (size == 3 && strncmp(text, "max", 3) == 0) parsed = 3;
++    else return POWER_INVALID;
++    power = parsed;
++    return POWER_SET;
++}
++
++inline bool parseCommandTopic(const char* topic, char* name, size_t nameCapacity,
++                              char* command, size_t commandCapacity) {
++    if (!topic || !name || !command || !nameCapacity || !commandCapacity) return false;
++    const char* first = strchr(topic, '/');
++    if (!first || first == topic) return false;
++    if (strncmp(first, "/cmnd/", 6) != 0) return false;
++    const char* verb = first + 6;
++    if (!*verb || strchr(verb, '/')) return false;
++    size_t nameSize = static_cast<size_t>(first - topic);
++    size_t commandSize = strlen(verb);
++    if (nameSize >= nameCapacity || commandSize >= commandCapacity) return false;
++    memcpy(name, topic, nameSize);
++    name[nameSize] = '\0';
++    memcpy(command, verb, commandSize + 1);
++    return true;
++}
++}  // namespace YokisStability
++#endif

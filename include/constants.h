@@ -1,3 +1,4 @@
+// Modified in the alban-ops shutters/stability derivative (2026). See CHANGELOG.md and NOTICE.
 #ifndef __CONSTANTS_H__
 #define __CONSTANTS_H__
 
@@ -52,6 +53,7 @@
 #define YOKIS_CMD_OFF_SHUTTER 0xfa
 #define YOKIS_CMD_SHUTTER_PAUSE 0x1a
 
-#define DEVICE_MAX_FAILED_POLLING_BEFORE_OFFLINE 3
+#include "RF/stabilityPolicy.h"
+#define DEVICE_MAX_FAILED_POLLING_BEFORE_OFFLINE YokisStability::OFFLINE_FAILURES
 
 #endif
